@@ -146,54 +146,90 @@ game_init :: proc(game: ^Game) {
 }
 
 SHIP_CONTROL_ACC :: 100
-SHIP_CONTROL_TURN :: 100
+SHIP_CONTROL_TURN_COEFF :: 0.8
 SHIP_BRAKES_INV_COEFF :: 0.05
 SHIP_MAX_VELOCITY :: 100
 
 FORWARD_FRICTION_INV_COEFF :: 0.008
-LATERAL_FRICTION_INV_COEFF :: 0.2
+LATERAL_FRICTION_INV_COEFF :: 0
+//LATERAL_FRICTION_INV_COEFF :: 0.2
 
+CAMERA_XZ_VEL :: 100
+CAMERA_Y_VEL :: 5
+CAMERA_FOV :: 75
 
+get_camera_offset :: proc(game: ^Game) -> v3 {
+    camera_off_z, camera_off_x := math.sincos(rl.DEG2RAD * game.camera_xz_angle)
+    camera_off_xz := v2{camera_off_x, camera_off_z}
+    camera_off_xz *= game.camera_xz_distance
+    return v3{camera_off_xz.x, game.camera_y_height, camera_off_xz.y}
+}
+
+// degrees
+normalize_angle :: proc(angle: f32) -> f32 {
+    return math.mod(angle + 36000, 360)
+}
 
 game_update_and_draw :: proc(game: ^Game, paused: bool) {
     dt := rl.GetFrameTime()
 
     player := &game.entities[PLAYER_ENTITY_INDEX]
 
+    target_mag: f32
+    target_dir: v3
+    target_angle: f32
+
     if !paused { // update
         e := player
 
-        // TODO: update camera
+        input_dir_x := rl.GetGamepadAxisMovement(0, .LEFT_X)
+        input_dir_y := rl.GetGamepadAxisMovement(0, .LEFT_Y)
+
+        input_mag := linalg.length(v2{input_dir_x, input_dir_y})
+
+        input_angle := rl.RAD2DEG * linalg.atan2(input_dir_y, input_dir_x)
+        input_angle += game.camera_xz_angle - 90
+        input_angle = normalize_angle(input_angle)
+
+        input_dir_y, input_dir_x = math.sincos(rl.DEG2RAD * input_angle)
+
+        input := v3{input_dir_x, 0, input_dir_y}
+
+        target_mag = input_mag
+        target_dir = linalg.normalize0(input)
+        target_angle = input_angle
+
+        {// update camera
+            game.camera_xz_angle += rl.GetGamepadAxisMovement(0, .RIGHT_X) * CAMERA_XZ_VEL * dt
+            game.camera_y_height += -rl.GetGamepadAxisMovement(0, .RIGHT_Y) * CAMERA_XZ_VEL * dt
+
+            game.camera_xz_angle = normalize_angle(game.camera_xz_angle)
+            game.camera_y_height = max(game.camera_y_height, 2)
+        }
 
         { // update player
-            dir_x := rl.GetGamepadAxisMovement(0, .LEFT_X)
-            dir_y := rl.GetGamepadAxisMovement(0, .LEFT_Y)
-
-            sticks := v3{dir_x, 0, dir_y}
-            target_mag := linalg.length(sticks)
-            target_dir := linalg.normalize0(sticks)
-
             // rotation
-            drot: f32
-            if rl.IsKeyDown(.RIGHT) do drot -= SHIP_CONTROL_TURN
-            if rl.IsKeyDown(.LEFT)  do drot += SHIP_CONTROL_TURN
+            if target_mag > 0 {
+                d_rot := target_angle - e.rot
+                d_rot = normalize_angle(d_rot+180)-180
+                e.rot += SHIP_CONTROL_TURN_COEFF * dt * d_rot
+                e.rot = normalize_angle(e.rot)
+            }      
 
-            e.rot += drot * dt * max(linalg.length(e.vel) / SHIP_MAX_VELOCITY, 0.2)
-
-            // movement in direction
-            acc_mag: f32 = rl.IsKeyDown(.UP) ? SHIP_CONTROL_ACC : 0
-            brakes: f32 = rl.IsKeyDown(.DOWN) ? SHIP_BRAKES_INV_COEFF : 0
-
+            // friction
+            acc_mag: f32 = target_mag * SHIP_CONTROL_ACC
+            brakes: f32 = rl.IsGamepadButtonDown(0, .RIGHT_TRIGGER_1) ? SHIP_BRAKES_INV_COEFF : 0
             lateral_friction := linalg.dot(v2{-e.vel.y, e.vel.x}, e.vel) * LATERAL_FRICTION_INV_COEFF
-
             total_friction := brakes + FORWARD_FRICTION_INV_COEFF + lateral_friction
-
             e.vel *= 1 - total_friction
 
-            dir_y, dir_x := math.sincos(rl.DEG2RAD * e.rot)
-            acc := v2{-dir_x, dir_y} * acc_mag
+            ship_dir_y, ship_dir_x := math.sincos(rl.DEG2RAD*e.rot)
+            ship_dir := v2{ship_dir_x, ship_dir_y}
+            acc := ship_dir * acc_mag
             e.pos += dt*e.vel + 0.5*e.acc*dt*dt
             e.vel += 0.5*(e.acc + acc)*dt
+
+            // clamp velocity megnitude
             vel_mag := min(linalg.length(e.vel), SHIP_MAX_VELOCITY)
             e.vel = vel_mag*linalg.normalize0(e.vel)
 
@@ -201,16 +237,11 @@ game_update_and_draw :: proc(game: ^Game, paused: bool) {
         }
     }
 
-    camera_off_z, camera_off_x := math.sincos(rl.DEG2RAD * game.camera_xz_angle)
-    camera_off_xz := v2{camera_off_x, camera_off_z}
-    camera_off_xz *= game.camera_xz_distance
-    camera_off := v3{camera_off_xz.x, game.camera_y_height, camera_off_xz.y}
-
     camera := rl.Camera {
         target = entity_pos(player.pos),
-        position = entity_pos(player.pos) + camera_off,
+        position = entity_pos(player.pos) + get_camera_offset(game),
         up = {0, 1, 0},
-        fovy = 75,
+        fovy = CAMERA_FOV,
         projection = .PERSPECTIVE,
     }
 
@@ -230,21 +261,20 @@ game_update_and_draw :: proc(game: ^Game, paused: bool) {
                 tint := i == PLAYER_ENTITY_INDEX ? rl.WHITE : rl.RED
                 draw_pos := v3{e.pos.x, 0, e.pos.y}
 
-                rl.DrawModelEx(e.model, draw_pos, {0, 1, 0}, e.rot, 1, tint)
+                rl.DrawModelEx(e.model, draw_pos, {0, -1, 0}, e.rot + 180, 1, tint)
             }
 
-            when DEV {
+            if DEV && target_mag > 0 {
                 model := game.models["UI_Red_X"]
-                dir_x := rl.GetGamepadAxisMovement(0, .LEFT_X)
-                dir_y := rl.GetGamepadAxisMovement(0, .LEFT_Y)
-
-                sticks := v3{dir_x, 0, dir_y}
-                target_mag := linalg.length(sticks)
-                target_dir := linalg.normalize0(sticks)
-
                 target_spot := entity_pos(player.pos) + target_dir * (SHIP_MAX_VELOCITY * target_mag)
-
                 rl.DrawModel(model, target_spot, 10, rl.WHITE)
+            }
+
+            when false {
+                // what even is e.rot
+                target_y, target_x := math.sincos(rl.DEG2RAD * player.rot)
+                target_spot := entity_pos(player.pos) + v3{target_x, 0, target_y}*10
+                rl.DrawModel(game.models["UI_Red_X"], target_spot, 10, rl.BLUE)  
             }
         }
 
@@ -280,6 +310,11 @@ main :: proc() {
 
     rl.SetConfigFlags({.VSYNC_HINT, .MSAA_4X_HINT})
     
+    when !DEV { // by default ray uses ESC for exit
+                // i like this for developing, but not for users
+       rl.SetExitKey(nil)
+    }
+
     // so the sails don't get culled out
     rlgl.DisableBackfaceCulling()
 
