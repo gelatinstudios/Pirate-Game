@@ -22,19 +22,6 @@ DEV :: #config(DEV, false)
 WINDOW_WIDTH  :: 1280
 WINDOW_HEIGHT :: 720
 
-color_invert :: proc(c: rl.Color) -> rl.Color {
-    return {255-c.r, 255-c.g, 255-c.b, c.a}
-}
-
-hex_color :: proc(c: u32) -> rl.Color {
-    return {
-        u8(c >> 16),
-        u8(c >>  8),
-        u8(c >>  0),
-        255,
-    }
-}
-
 load_models :: proc($dir_path: string) -> map[string]rl.Model {
     model_files, match_err := filepath.glob(dir_path + "/*.gltf")
     assert(match_err == nil)
@@ -64,36 +51,43 @@ Game_State :: enum {
     View_Models,
 }
 
-PLAYER_ENTITY_INDEX :: 0
-
-entity_pos :: proc(v: v2) -> v3 {
-    return v3{v.x, 0, v.y}
+Entity :: struct {
+    pos, vel, acc, prev_acc: v2,
+    rot: f32,
+    brain: Enemy_Brain,
+    model: rl.Model,
 }
 
-Entity :: struct {
-    pos, vel, acc: v2,
-    rot: f32,
-    model: rl.Model,
+Enemy_Brain :: struct {
+    input: v3,
+    timer: f32,
 }
 
 Game :: struct {
     screen_width, screen_height: i32,
 
-    state: Game_State,
     models: map[string]rl.Model,
     ocean: rl.Model,
     camera_xz_distance: f32,
     camera_xz_angle: f32,
     camera_y_height: f32,
 
+    state: Game_State,
+    player_is_aiming: bool,
     entities: [dynamic]Entity,
+
+    // indices
+    player_index: int,
+    enemy_start: int,
+    enemy_end: int,
 
     // dev
     using dev: Dev_State,
 }
 
 
-OCEAN_LENGTH :: 1000
+OCEAN_EXTENT :: 1000
+OCEAN_LENGTH :: OCEAN_EXTENT * 2
 OCEAN_HEIGHT :: 5
 
 game_init :: proc(game: ^Game) {
@@ -122,12 +116,14 @@ game_init :: proc(game: ^Game) {
     game.entities = make([dynamic]Entity)
 
     // player entity
+    game.player_index = len(game.entities)
     append(&game.entities, Entity{
         model = game.models["Ship_Large"],
     })
 
     ENEMY_COUNT :: 100
 
+    game.enemy_start = len(game.entities)
     for _ in 0 ..< ENEMY_COUNT {
         entity: Entity
         entity.pos.x = rand.float32() * OCEAN_LENGTH - OCEAN_LENGTH*.5
@@ -137,6 +133,7 @@ game_init :: proc(game: ^Game) {
 
         append(&game.entities, entity)
     }
+    game.enemy_end = len(game.entities)
 
     game.state = .Playing
 
@@ -145,35 +142,61 @@ game_init :: proc(game: ^Game) {
     }
 }
 
+get_player :: proc(game: ^Game) -> ^Entity {
+    return &game.entities[game.player_index]
+}
+get_camera_pos :: proc(game: ^Game) -> v3 {
+    camera_off_xz := angle_to_v2(game.camera_xz_angle) * game.camera_xz_distance
+    return expand_to_v3(get_player(game).pos) + v3{camera_off_xz.x, game.camera_y_height, camera_off_xz.y}
+}
+
+create_cannon_entity :: proc(ship: Entity) -> Entity {
+    // TODO:
+    return {}
+}
+
 SHIP_CONTROL_ACC :: 100
 SHIP_CONTROL_TURN_COEFF :: 0.8
 SHIP_BRAKES_INV_COEFF :: 0.05
 SHIP_MAX_VELOCITY :: 100
 
-FORWARD_FRICTION_INV_COEFF :: 0.008
-LATERAL_FRICTION_INV_COEFF :: 0
-//LATERAL_FRICTION_INV_COEFF :: 0.2
+FORWARD_FRICTION_INV_COEFF :: 0.02
 
 CAMERA_XZ_VEL :: 100
 CAMERA_Y_VEL :: 5
 CAMERA_FOV :: 75
 
-get_camera_offset :: proc(game: ^Game) -> v3 {
-    camera_off_z, camera_off_x := math.sincos(rl.DEG2RAD * game.camera_xz_angle)
-    camera_off_xz := v2{camera_off_x, camera_off_z}
-    camera_off_xz *= game.camera_xz_distance
-    return v3{camera_off_xz.x, game.camera_y_height, camera_off_xz.y}
-}
+ship_move :: proc(e: ^Entity, input: v3, brakes: bool) {
+    dt := rl.GetFrameTime()
 
-// degrees
-normalize_angle :: proc(angle: f32) -> f32 {
-    return math.mod(angle + 36000, 360)
+    input_mag := linalg.length(input)
+    input_dir := linalg.normalize0(input)
+    input_angle := v2_to_angle(input.xz)
+
+    // rotation
+    if input_mag > 0 {
+        d_rot := input_angle - e.rot
+        d_rot = normalize_angle(d_rot+180)-180
+        e.rot += SHIP_CONTROL_TURN_COEFF * dt * d_rot
+        e.rot = normalize_angle(e.rot)
+    }      
+
+    ship_dir := angle_to_v2(e.rot)
+
+    // friction
+    acc_mag: f32 = linalg.dot(input_mag * input_dir, expand_to_v3(ship_dir))  * SHIP_CONTROL_ACC
+    brakes_friction: f32 = brakes ? SHIP_BRAKES_INV_COEFF : 0
+    lateral_friction := linalg.dot(v2{-e.vel.y, e.vel.x}, e.vel)
+    total_friction := brakes_friction + FORWARD_FRICTION_INV_COEFF + lateral_friction
+    e.vel *= 1 - total_friction
+
+    e.acc = ship_dir * acc_mag
 }
 
 game_update_and_draw :: proc(game: ^Game, paused: bool) {
     dt := rl.GetFrameTime()
 
-    player := &game.entities[PLAYER_ENTITY_INDEX]
+    player := &game.entities[game.player_index ]
 
     target_mag: f32
     target_dir: v3
@@ -182,24 +205,19 @@ game_update_and_draw :: proc(game: ^Game, paused: bool) {
     if !paused { // update
         e := player
 
-        input_dir_x := rl.GetGamepadAxisMovement(0, .LEFT_X)
-        input_dir_y := rl.GetGamepadAxisMovement(0, .LEFT_Y)
+        // cannon fire
+        player_fired_cannon: bool
+        if rl.IsGamepadButtonDown(0, .RIGHT_TRIGGER_2) {
+            game.player_is_aiming = true
+        } else {
+            player_fired_cannon = game.player_is_aiming
+            game.player_is_aiming = false
+        }
+        if player_fired_cannon {
+            append(&game.entities, create_cannon_entity(player^))
+        }
 
-        input_mag := linalg.length(v2{input_dir_x, input_dir_y})
-
-        input_angle := rl.RAD2DEG * linalg.atan2(input_dir_y, input_dir_x)
-        input_angle += game.camera_xz_angle - 90
-        input_angle = normalize_angle(input_angle)
-
-        input_dir_y, input_dir_x = math.sincos(rl.DEG2RAD * input_angle)
-
-        input := v3{input_dir_x, 0, input_dir_y}
-
-        target_mag = input_mag
-        target_dir = linalg.normalize0(input)
-        target_angle = input_angle
-
-        {// update camera
+        if !game.player_is_aiming {// update camera
             game.camera_xz_angle += rl.GetGamepadAxisMovement(0, .RIGHT_X) * CAMERA_XZ_VEL * dt
             game.camera_y_height += -rl.GetGamepadAxisMovement(0, .RIGHT_Y) * CAMERA_XZ_VEL * dt
 
@@ -207,47 +225,69 @@ game_update_and_draw :: proc(game: ^Game, paused: bool) {
             game.camera_y_height = max(game.camera_y_height, 2)
         }
 
-        { // update player
-            // rotation
-            if target_mag > 0 {
-                d_rot := target_angle - e.rot
-                d_rot = normalize_angle(d_rot+180)-180
-                e.rot += SHIP_CONTROL_TURN_COEFF * dt * d_rot
-                e.rot = normalize_angle(e.rot)
-            }      
+        raw_input := left_stick(0)
 
-            // friction
-            acc_mag: f32 = target_mag * SHIP_CONTROL_ACC
-            brakes: f32 = rl.IsGamepadButtonDown(0, .RIGHT_TRIGGER_1) ? SHIP_BRAKES_INV_COEFF : 0
-            lateral_friction := linalg.dot(v2{-e.vel.y, e.vel.x}, e.vel) * LATERAL_FRICTION_INV_COEFF
-            total_friction := brakes + FORWARD_FRICTION_INV_COEFF + lateral_friction
-            e.vel *= 1 - total_friction
+        input_mag := linalg.length(raw_input)
 
-            ship_dir_y, ship_dir_x := math.sincos(rl.DEG2RAD*e.rot)
-            ship_dir := v2{ship_dir_x, ship_dir_y}
-            acc := ship_dir * acc_mag
+        input_angle := v2_to_angle(raw_input)
+        input_angle += game.camera_xz_angle - 90
+        input_angle = normalize_angle(input_angle)
+
+        input := expand_to_v3(angle_to_v2(input_angle)) * input_mag
+
+        ship_move(player, input, rl.IsGamepadButtonDown(0, .RIGHT_TRIGGER_1))
+
+        for &e in game.entities[game.enemy_start:game.enemy_end] {
+            b := &e.brain
+            b.timer -= dt
+            if b.timer <= 0 {
+                input: v3
+                for &f in input {
+                    f = rand.float32() * 2 - 1
+                }
+                b.input = linalg.normalize0(input) * rand.float32()
+                b.timer = 5
+            }
+            ship_move(&e, b.input, false)
+        }
+
+        // collision
+        for &e in game.entities[game.player_index:game.enemy_end] {
+            out_of_bounds := false
+            for f in e.pos {
+                out_of_bounds ||= abs(f) > OCEAN_EXTENT
+            }
+
+            if out_of_bounds {
+                e.acc = 0
+                e.vel = 0
+            }
+        }
+
+        // movement update
+        for &e in game.entities {
             e.pos += dt*e.vel + 0.5*e.acc*dt*dt
-            e.vel += 0.5*(e.acc + acc)*dt
+            e.vel += 0.5*(e.acc + e.prev_acc)*dt
 
+            // TODO: not everything is a ship
             // clamp velocity megnitude
             vel_mag := min(linalg.length(e.vel), SHIP_MAX_VELOCITY)
             e.vel = vel_mag*linalg.normalize0(e.vel)
 
-            e.acc = acc
+            e.prev_acc = e.acc
         }
     }
 
     camera := rl.Camera {
-        target = entity_pos(player.pos),
-        position = entity_pos(player.pos) + get_camera_offset(game),
+        target = expand_to_v3(player.pos),
+        position = get_camera_pos(game),
         up = {0, 1, 0},
         fovy = CAMERA_FOV,
         projection = .PERSPECTIVE,
     }
 
     { // draw
-        rl.BeginDrawing()
-        defer rl.EndDrawing()
+        rl.BeginDrawing() // DOES NOT call EndDrawing()
 
         rl.ClearBackground(rl.SKYBLUE)
 
@@ -258,23 +298,16 @@ game_update_and_draw :: proc(game: ^Game, paused: bool) {
             rl.DrawModel(game.ocean, {0, -.5*OCEAN_HEIGHT, 0}, 1, rl.WHITE)
             
             for e, i in game.entities {
-                tint := i == PLAYER_ENTITY_INDEX ? rl.WHITE : rl.RED
+                tint := i == game.player_index ? rl.WHITE : rl.RED
                 draw_pos := v3{e.pos.x, 0, e.pos.y}
 
                 rl.DrawModelEx(e.model, draw_pos, {0, -1, 0}, e.rot + 180, 1, tint)
             }
 
-            if DEV && target_mag > 0 {
+            if false && DEV && target_mag > 0 {
                 model := game.models["UI_Red_X"]
-                target_spot := entity_pos(player.pos) + target_dir * (SHIP_MAX_VELOCITY * target_mag)
+                target_spot := expand_to_v3(player.pos) + target_dir * (SHIP_MAX_VELOCITY * target_mag)
                 rl.DrawModel(model, target_spot, 10, rl.WHITE)
-            }
-
-            when false {
-                // what even is e.rot
-                target_y, target_x := math.sincos(rl.DEG2RAD * player.rot)
-                target_spot := entity_pos(player.pos) + v3{target_x, 0, target_y}*10
-                rl.DrawModel(game.models["UI_Red_X"], target_spot, 10, rl.BLUE)  
             }
         }
 
@@ -288,9 +321,7 @@ game_update_and_draw :: proc(game: ^Game, paused: bool) {
             rl.DrawText(text, x, y, size, rl.PURPLE)
         }
 
-        when DEV {
-            rl.DrawFPS(5,5)
-        }
+
     }
 }
 
@@ -300,6 +331,14 @@ update_and_draw :: proc(game: ^Game) {
         case .Playing:     game_update_and_draw(game, false)
         case .View_Models: when DEV { view_models(game) }
     }
+
+    when DEV {
+        if game.dev.show_ui do dev_ui(game)
+        rl.DrawFPS(5,5)
+    }
+
+    // putting this here allows us to add extra things like debug ui, editor, etc.
+    rl.EndDrawing()
 }
 
 main :: proc() {
@@ -310,9 +349,10 @@ main :: proc() {
 
     rl.SetConfigFlags({.VSYNC_HINT, .MSAA_4X_HINT})
     
-    when !DEV { // by default ray uses ESC for exit
-                // i like this for developing, but not for users
-       rl.SetExitKey(nil)
+    when !DEV { 
+        // by default, raylib uses ESC for exit
+        // i like this for developing, but not for users
+        rl.SetExitKey(nil)
     }
 
     // so the sails don't get culled out
@@ -325,6 +365,14 @@ main :: proc() {
 
         when DEV {
             dev_state(game, .V, .View_Models)
+
+            if is_ctrl_down() && rl.IsKeyPressed(.M) {
+                game.dev.show_ui = !game.dev.show_ui
+            }
+
+            if game.dev.show_ui {
+                dev_ui_input(&game.dev.ui)
+            }
         }
 
         if rl.IsKeyPressed(.P) {

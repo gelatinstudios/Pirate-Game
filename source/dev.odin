@@ -3,11 +3,16 @@ package pirates
 
 import "core:strings"
 import rl "vendor:raylib"
+import mu "vendor:microui"
 
 when DEV {
     Dev_State :: struct {
         prev_state: Game_State,
         view_models_camera: rl.Camera,
+
+        show_ui: bool,
+        ui: mu.Context,
+        ui_texture: rl.Texture2D,
     }
 
 
@@ -19,11 +24,11 @@ when DEV {
             projection = .PERSPECTIVE,
             fovy = 75,
         }
+        dev_ui_init(dev)
     }
 
     dev_state :: proc(game: ^Game, key: rl.KeyboardKey, state: Game_State) {
-        ctrl_down := rl.IsKeyDown(.LEFT_CONTROL) || rl.IsKeyDown(.RIGHT_CONTROL)
-        if ctrl_down && rl.IsKeyPressed(key) {
+        if is_ctrl_down() && rl.IsKeyPressed(key) {
             if game.state == state {
                 game.state = game.prev_state
             } else {
@@ -41,7 +46,6 @@ when DEV {
 
         {
             rl.BeginDrawing()
-            defer rl.EndDrawing()
 
             rl.ClearBackground(rl.SKYBLUE)
 
