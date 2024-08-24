@@ -193,93 +193,91 @@ ship_move :: proc(e: ^Entity, input: v3, brakes: bool) {
     e.acc = ship_dir * acc_mag
 }
 
-game_update_and_draw :: proc(game: ^Game, paused: bool) {
+update :: proc(game: ^Game) {
     dt := rl.GetFrameTime()
 
-    player := &game.entities[game.player_index ]
+    player := &game.entities[game.player_index]
 
-    target_mag: f32
-    target_dir: v3
-    target_angle: f32
+    // cannon fire
+    player_fired_cannon: bool
+    if rl.IsGamepadButtonDown(0, .RIGHT_TRIGGER_2) {
+        game.player_is_aiming = true
+    } else {
+        player_fired_cannon = game.player_is_aiming
+        game.player_is_aiming = false
+    }
+    if player_fired_cannon {
+        append(&game.entities, create_cannon_entity(player^))
+    }
 
-    if !paused { // update
-        e := player
+    if !game.player_is_aiming {// update camera
+        game.camera_xz_angle += rl.GetGamepadAxisMovement(0, .RIGHT_X) * CAMERA_XZ_VEL * dt
+        game.camera_y_height += -rl.GetGamepadAxisMovement(0, .RIGHT_Y) * CAMERA_XZ_VEL * dt
 
-        // cannon fire
-        player_fired_cannon: bool
-        if rl.IsGamepadButtonDown(0, .RIGHT_TRIGGER_2) {
-            game.player_is_aiming = true
-        } else {
-            player_fired_cannon = game.player_is_aiming
-            game.player_is_aiming = false
-        }
-        if player_fired_cannon {
-            append(&game.entities, create_cannon_entity(player^))
-        }
+        game.camera_xz_angle = normalize_angle(game.camera_xz_angle)
+        game.camera_y_height = max(game.camera_y_height, 2)
+    }
 
-        if !game.player_is_aiming {// update camera
-            game.camera_xz_angle += rl.GetGamepadAxisMovement(0, .RIGHT_X) * CAMERA_XZ_VEL * dt
-            game.camera_y_height += -rl.GetGamepadAxisMovement(0, .RIGHT_Y) * CAMERA_XZ_VEL * dt
+    raw_input := left_stick(0)
 
-            game.camera_xz_angle = normalize_angle(game.camera_xz_angle)
-            game.camera_y_height = max(game.camera_y_height, 2)
-        }
+    input_mag := linalg.length(raw_input)
 
-        raw_input := left_stick(0)
+    input_angle := v2_to_angle(raw_input)
+    input_angle += game.camera_xz_angle - 90
+    input_angle = normalize_angle(input_angle)
 
-        input_mag := linalg.length(raw_input)
+    input := expand_to_v3(angle_to_v2(input_angle)) * input_mag
 
-        input_angle := v2_to_angle(raw_input)
-        input_angle += game.camera_xz_angle - 90
-        input_angle = normalize_angle(input_angle)
+    ship_move(player, input, rl.IsGamepadButtonDown(0, .RIGHT_TRIGGER_1))
 
-        input := expand_to_v3(angle_to_v2(input_angle)) * input_mag
-
-        ship_move(player, input, rl.IsGamepadButtonDown(0, .RIGHT_TRIGGER_1))
-
-        for &e in game.entities[game.enemy_start:game.enemy_end] {
-            b := &e.brain
-            b.timer -= dt
-            if b.timer <= 0 {
-                input: v3
-                for &f in input {
-                    f = rand.float32() * 2 - 1
-                }
-                b.input = linalg.normalize0(input) * rand.float32()
-                b.timer = 5
+    for &e in game.entities[game.enemy_start:game.enemy_end] {
+        b := &e.brain
+        b.timer -= dt
+        if b.timer <= 0 {
+            input: v3
+            for &f in input {
+                f = rand.float32() * 2 - 1
             }
-            ship_move(&e, b.input, false)
+            b.input = linalg.normalize0(input) * rand.float32()
+            b.timer = 5
+        }
+        ship_move(&e, b.input, false)
+    }
+
+    // collision
+    for &e in game.entities[game.player_index:game.enemy_end] {
+        out_of_bounds := false
+        for f in e.pos {
+            out_of_bounds ||= abs(f) > OCEAN_EXTENT
         }
 
-        // collision
-        for &e in game.entities[game.player_index:game.enemy_end] {
-            out_of_bounds := false
-            for f in e.pos {
-                out_of_bounds ||= abs(f) > OCEAN_EXTENT
-            }
-
-            if out_of_bounds {
-                e.acc = 0
-                e.vel = 0
-            }
-        }
-
-        // movement update
-        for &e in game.entities {
-            e.pos += dt*e.vel + 0.5*e.acc*dt*dt
-            e.vel += 0.5*(e.acc + e.prev_acc)*dt
-
-            // TODO: not everything is a ship
-            // clamp velocity megnitude
-            vel_mag := min(linalg.length(e.vel), SHIP_MAX_VELOCITY)
-            e.vel = vel_mag*linalg.normalize0(e.vel)
-
-            e.prev_acc = e.acc
+        if out_of_bounds {
+            e.acc = 0
+            e.vel = 0
         }
     }
 
+    // movement update
+    for &e in game.entities {
+        e.pos += dt*e.vel + 0.5*e.acc*dt*dt
+        e.vel += 0.5*(e.acc + e.prev_acc)*dt
+
+        // TODO: not everything is a ship
+        // clamp velocity megnitude
+        vel_mag := min(linalg.length(e.vel), SHIP_MAX_VELOCITY)
+        e.vel = vel_mag*linalg.normalize0(e.vel)
+
+        e.prev_acc = e.acc
+    }
+}
+
+game_update_and_draw :: proc(game: ^Game, paused: bool) {
+    if !paused {
+        update(game)
+    }
+
     camera := rl.Camera {
-        target = expand_to_v3(player.pos),
+        target = expand_to_v3(get_player(game).pos),
         position = get_camera_pos(game),
         up = {0, 1, 0},
         fovy = CAMERA_FOV,
@@ -303,12 +301,6 @@ game_update_and_draw :: proc(game: ^Game, paused: bool) {
 
                 rl.DrawModelEx(e.model, draw_pos, {0, -1, 0}, e.rot + 180, 1, tint)
             }
-
-            if false && DEV && target_mag > 0 {
-                model := game.models["UI_Red_X"]
-                target_spot := expand_to_v3(player.pos) + target_dir * (SHIP_MAX_VELOCITY * target_mag)
-                rl.DrawModel(model, target_spot, 10, rl.WHITE)
-            }
         }
 
         if paused {
@@ -320,8 +312,6 @@ game_update_and_draw :: proc(game: ^Game, paused: bool) {
             y := (game.screen_height - size)/2
             rl.DrawText(text, x, y, size, rl.PURPLE)
         }
-
-
     }
 }
 

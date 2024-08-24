@@ -84,9 +84,16 @@ dev_ui_reflect :: proc(ui: ^mu.Context, v: any, name: string, $is_header: bool) 
 		mu.label(ui, "=")
 		mu.label(ui, fmt.tprint(v))
 	}
+
 	base := reflect.type_info_base(type_info_of(v.id))
 
-	if reflect.is_struct(base) || reflect.is_union(base) {
+	if reflect.is_pointer(base) {
+		if reflect.is_nil(v) {
+			value_label(ui, v, name)
+		} else {
+			dev_ui_reflect(ui, reflect.deref(v), name, false)
+		}
+	} else if reflect.is_struct(base) || reflect.is_union(base) {
 		mu.push_id(ui, uintptr(v.data))
 		defer mu.pop_id(ui)
 
@@ -114,12 +121,24 @@ dev_ui_reflect :: proc(ui: ^mu.Context, v: any, name: string, $is_header: bool) 
 			if .ACTIVE in mu.treenode(ui, text) {
 				it := 0
 				for e,i in reflect.iterate_array(v, &it) {
-					dev_ui_reflect(ui, e, fmt.tprintf("[{}]", it-1), false)
+					dev_ui_reflect(ui, e, fmt.tprintf("[{}]", i), false)
 				}
 			}
 		}
 	} else if reflect.is_dynamic_map(base) {
-		// TODO
+		map_len := reflect.length(v)
+		if map_len < 10 {
+			value_label(ui, v, name)
+		} else {
+			text := fmt.tprintf("{} (len={})", name, map_len)
+
+			if .ACTIVE in mu.treenode(ui, text) {
+				it := 0
+				for k,val in reflect.iterate_map(v, &it) {
+					dev_ui_reflect(ui, val, fmt.tprintf("[{}]", k), false)
+				}
+			}
+		}
 	} else {
 		value_label(ui, v, name)
 	}
